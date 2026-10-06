@@ -1,0 +1,752 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>四季草地小花园</title>
+<style>
+  * { box-sizing: border-box; user-select: none; -webkit-user-select: none; }
+  html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #f3ecdd; }
+  canvas { display: block; width: 100vw; height: 100vh; touch-action: none; cursor: grab; }
+  canvas:active { cursor: grabbing; }
+</style>
+</head>
+<body>
+<canvas id="scene" aria-label="可旋转的手绘草地小景"></canvas>
+<script>
+'use strict';
+const TAU = Math.PI * 2;
+const canvas = document.querySelector('#scene');
+const mainContext = canvas.getContext('2d');
+let ctx = mainContext;
+const staticLayer = document.createElement('canvas');
+let staticContext = staticLayer.getContext('2d'), staticCacheKey='';
+const themes = [
+  { name: '春', top: '#A9B985', light: '#CAD5A0', dark: '#7C9666', soil: '#B99A79', side: '#98765D', ink: '#51483D' },
+  { name: '夏', top: '#78966B', light: '#AEC08A', dark: '#587552', soil: '#A98768', side: '#80634F', ink: '#48483B' },
+  { name: '秋', top: '#C39A6B', light: '#D8BD8B', dark: '#A47C56', soil: '#B58A68', side: '#8D6953', ink: '#55463B' },
+  { name: '冬', top: '#A6B5B6', light: '#D0D9D2', dark: '#7F969A', soil: '#B2A99B', side: '#89847C', ink: '#4D4B48' }
+];
+let themeIndex = 0;
+let width = 0, height = 0, dpr = 1, scale = 1;
+const camera = { angle: -0.68, tilt: 1.02, distance: 5.7 };
+const half = 1.15, bottom = -0.55, focal = 580;
+let paper = document.createElement('canvas');
+let drag = null;
+
+function color(hex, alpha=1) {
+  const n = parseInt(hex.slice(1), 16);
+  return `rgba(${n >> 16},${(n >> 8) & 255},${n & 255},${alpha})`;
+}
+function seeded(seed) {
+  let x = Math.sin(seed * 127.1 + 311.7) * 43758.5453;
+  return x - Math.floor(x);
+}
+const FLOWERS = [
+  { id:'daisy', name:'雏菊', unlockAt:0, points:1, weight:1.7 },
+  { id:'tulip', name:'郁金香', unlockAt:30, points:2, weight:1 },
+  { id:'poppy', name:'虞美人', unlockAt:80, points:3, weight:1 },
+  { id:'lavender', name:'薰衣草', unlockAt:200, points:4, weight:.35 },
+  { id:'dandelion', name:'蒲公英', unlockAt:300, points:5, weight:.32 }
+];
+const FLOWER_PALETTES = {
+  daisy:['#fff0cf','#f7e4a5','#f5c5d2','#efb5c3','#b9d7ee','#c8e0d5','#f0d9bd'],
+  tulip:['#f3b9c5','#f7dc91','#b9d9ef','#e6bfd6','#f4c9aa','#c7dfd0'],
+  poppy:['#efb7b5','#f5c9aa','#f4dda0','#bfd8ee','#efc5d6','#d4e3bc'],
+  lavender:['#9a83a6','#a88da6','#88759d','#b5a0bd','#8276a0'],
+  dandelion:['#f8f6ef']
+};
+function chooseFlower(id, scoreAtBirth) {
+  const available=FLOWERS.filter(f=>scoreAtBirth>=f.unlockAt);
+  const total=available.reduce((sum,f)=>sum+f.weight,0);
+  let roll=seeded(id+100)*total;
+  for(const flower of available) {
+    roll-=flower.weight;
+    if(roll<0) return flower.id;
+  }
+  return available[available.length-1].id;
+}
+function flowerProfile(id) { return FLOWERS.find(f=>f.id===id)||FLOWERS[0]; }
+function nextFlowerUnlock(total=score) { return FLOWERS.find(f=>f.unlockAt>total)||null; }
+const grassBlades=[];
+for(let cluster=0;cluster<38;cluster++) {
+  const cx=-.78+seeded(cluster+500)*1.56, cz=-.78+seeded(cluster+900)*1.56;
+  const phase=seeded(cluster+1300)*TAU;
+  for(let blade=0;blade<5;blade++) {
+    const id=cluster*11+blade;
+    grassBlades.push({
+      x:cx+(seeded(id+1700)-.5)*.18,
+      z:cz+(seeded(id+2100)-.5)*.18,
+      h:.12+seeded(id+2500)*.19,
+      baseX:(seeded(id+2900)-.5)*.10,
+      side:(seeded(id+3300)-.5)*.10,
+      phase:phase+(seeded(id+3700)-.5)*.55,
+      tone:seeded(id+4100)
+    });
+  }
+}
+let animationTime=0;
+let sowMode=false, harvestMode=false, score=0, seeds=[], plants=[], nextSeedId=1, pickups=[], fluffs=[], unlockToast=null;
+let butterflies=[], nextButterflyId=1, butterflySpawnTimer=2;
+let lastFrameTime=0;
+function resize() {
+  dpr = Math.min(devicePixelRatio || 1, 2);
+  width = innerWidth; height = innerHeight;
+  canvas.width = Math.round(width * dpr); canvas.height = Math.round(height * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  scale = Math.min(1.5, Math.max(1, Math.min(width, height) / 430));
+  makePaper(); render();
+}
+function makePaper() {
+  paper.width = Math.max(1, Math.round(width * dpr));
+  paper.height = Math.max(1, Math.round(height * dpr));
+  const p = paper.getContext('2d');
+  p.setTransform(dpr, 0, 0, dpr, 0, 0);
+  p.fillStyle = '#f3ecdd'; p.fillRect(0, 0, width, height);
+  for (let i = 0; i < 12; i++) {
+    const x = seeded(i + 1) * width, y = seeded(i + 31) * height;
+    const r = 50 + seeded(i + 61) * 150;
+    const g = p.createRadialGradient(x, y, 0, x, y, r);
+    g.addColorStop(0, 'rgba(210,193,163,.07)'); g.addColorStop(1, 'rgba(210,193,163,0)');
+    p.fillStyle = g; p.fillRect(x-r, y-r, r*2, r*2);
+  }
+  for (let i = 0; i < 1500; i++) {
+    const x = seeded(i+100) * width, y = seeded(i+2100) * height;
+    p.fillStyle = `rgba(117,99,71,${0.025 + seeded(i+4100)*0.035})`;
+    p.fillRect(x, y, .7, .7);
+  }
+}
+function cameraBasis() {
+  const sp = Math.sin(camera.tilt), cp = Math.cos(camera.tilt);
+  const eye = [camera.distance * sp * Math.sin(camera.angle), camera.distance * cp, camera.distance * sp * Math.cos(camera.angle)];
+  const len = Math.hypot(...eye), f = eye.map(v => -v / len);
+  // Right = forward × world-up. The previous sign exposed the underside as if it were the lawn.
+  const r = [-f[2], 0, f[0]], rl = Math.hypot(...r); r[0] /= rl; r[2] /= rl;
+  const u = [r[1]*f[2]-r[2]*f[1], r[2]*f[0]-r[0]*f[2], r[0]*f[1]-r[1]*f[0]];
+  const fl = Math.min(width, height) * .5 / Math.tan(38 * Math.PI / 360);
+  return p => {
+    const d = p[0]*f[0] + p[1]*f[1] + p[2]*f[2] + len;
+    if (d < .1) return null;
+    return [width/2 + (p[0]*r[0]+p[1]*r[1]+p[2]*r[2]) / d * fl,
+            height/2 - (p[0]*u[0]+p[1]*u[1]+p[2]*u[2]) / d * fl];
+  };
+}
+function polygon(points, fill, stroke=null, lineWidth=1) {
+  if (points.some(p => !p)) return;
+  ctx.beginPath(); ctx.moveTo(points[0][0], points[0][1]);
+  for (let i=1; i<points.length; i++) ctx.lineTo(points[i][0], points[i][1]);
+  ctx.closePath(); ctx.fillStyle=fill; ctx.fill();
+  if (stroke) { ctx.strokeStyle=stroke; ctx.lineWidth=lineWidth*scale; ctx.lineJoin='round'; ctx.stroke(); }
+}
+function softPolygon(points, hex, alpha, bleed=5) {
+  if(points.some(p=>!p)) return;
+  ctx.save(); ctx.shadowColor=color(hex,alpha*.56); ctx.shadowBlur=bleed*scale;
+  polygon(points,color(hex,alpha*.58)); ctx.restore();
+  polygon(points,color(hex,alpha));
+}
+function wavyEdge(a,b,amplitude,seed) {
+  const dx=b[0]-a[0], dz=b[2]-a[2], len=Math.hypot(dx,dz)||1;
+  const nx=-dz/len, nz=dx/len, pts=[];
+  for(let i=0;i<=12;i++) {
+    const t=i/12, fade=Math.sin(Math.PI*t);
+    const noise=(seeded(seed+i*13)-.5)*2*amplitude*fade;
+    pts.push([a[0]+dx*t+nx*noise,a[1]+(b[1]-a[1])*t,a[2]+dz*t+nz*noise]);
+  }
+  return pts;
+}
+function roughSquare(x,y,size,seed) {
+  const corners=[[x,y],[x+size,y],[x+size,y+size],[x,y+size]], pts=[];
+  for(let e=0;e<4;e++) {
+    const a=corners[e], b=corners[(e+1)%4], dx=b[0]-a[0], dy=b[1]-a[1];
+    const len=Math.hypot(dx,dy)||1, nx=-dy/len, ny=dx/len;
+    for(let k=0;k<4;k++) {
+      const t=k/4, fade=Math.sin(Math.PI*t);
+      const wobble=(seeded(seed+e*17+k*7)-.5)*2*1.25*scale*fade;
+      pts.push([a[0]+dx*t+nx*wobble,a[1]+dy*t+ny*wobble]);
+    }
+  }
+  return pts;
+}
+function drawTaperedBlade(p0,p1,p2,p3,ink,baseWidth,alpha=.52) {
+  const left=[], right=[], steps=10;
+  for(let i=0;i<=steps;i++) {
+    const t=i/steps, u=1-t;
+    const cx=u*u*u*p0[0]+3*u*u*t*p1[0]+3*u*t*t*p2[0]+t*t*t*p3[0];
+    const cy=u*u*u*p0[1]+3*u*u*t*p1[1]+3*u*t*t*p2[1]+t*t*t*p3[1];
+    const dx=3*u*u*(p1[0]-p0[0])+6*u*t*(p2[0]-p1[0])+3*t*t*(p3[0]-p2[0]);
+    const dy=3*u*u*(p1[1]-p0[1])+6*u*t*(p2[1]-p1[1])+3*t*t*(p3[1]-p2[1]);
+    const len=Math.hypot(dx,dy)||1;
+    const taper=Math.pow(1-t,.78), halfWidth=baseWidth*taper*(.78+.22*Math.sin(Math.PI*t));
+    left.push([cx-dy/len*halfWidth,cy+dx/len*halfWidth]);
+    right.push([cx+dy/len*halfWidth,cy-dx/len*halfWidth]);
+  }
+  ctx.beginPath(); ctx.moveTo(left[0][0],left[0][1]);
+  for(let i=1;i<left.length;i++) ctx.lineTo(left[i][0],left[i][1]);
+  for(let i=right.length-1;i>=0;i--) ctx.lineTo(right[i][0],right[i][1]);
+  ctx.closePath(); ctx.fillStyle=color(ink,alpha); ctx.fill();
+}
+function groundPointAtScreen(px,py) {
+  const sp=Math.sin(camera.tilt), cp=Math.cos(camera.tilt);
+  const eye=[camera.distance*sp*Math.sin(camera.angle),camera.distance*cp,camera.distance*sp*Math.cos(camera.angle)];
+  const f=eye.map(v=>-v/camera.distance), r=[-f[2],0,f[0]], rl=Math.hypot(...r);
+  r[0]/=rl; r[2]/=rl;
+  const u=[r[1]*f[2]-r[2]*f[1],r[2]*f[0]-r[0]*f[2],r[0]*f[1]-r[1]*f[0]];
+  const fl=Math.min(width,height)*.5/Math.tan(38*Math.PI/360);
+  const sx=(px-width/2)/fl, sy=(height/2-py)/fl;
+  const dir=[f[0]+r[0]*sx+u[0]*sy,f[1]+r[1]*sx+u[1]*sy,f[2]+r[2]*sx+u[2]*sy];
+  if(dir[1]>=-.015) return null;
+  const t=-eye[1]/dir[1];
+  const point=[eye[0]+dir[0]*t,0,eye[2]+dir[2]*t];
+  if(Math.abs(point[0])>half-.04||Math.abs(point[2])>half-.04) return null;
+  return point;
+}
+function worldPointForScreenAtHeight(px,py,planeY) {
+  const sp=Math.sin(camera.tilt), cp=Math.cos(camera.tilt);
+  const eye=[camera.distance*sp*Math.sin(camera.angle),camera.distance*cp,camera.distance*sp*Math.cos(camera.angle)];
+  const f=eye.map(v=>-v/camera.distance), r=[-f[2],0,f[0]], rl=Math.hypot(...r);
+  r[0]/=rl; r[2]/=rl;
+  const u=[r[1]*f[2]-r[2]*f[1],r[2]*f[0]-r[0]*f[2],r[0]*f[1]-r[1]*f[0]];
+  const fl=Math.min(width,height)*.5/Math.tan(38*Math.PI/360);
+  const sx=(px-width/2)/fl, sy=(height/2-py)/fl;
+  const dir=[f[0]+r[0]*sx+u[0]*sy,f[1]+r[1]*sx+u[1]*sy,f[2]+r[2]*sx+u[2]*sy];
+  if(dir[1]>=-.015) return null;
+  const t=(planeY-eye[1])/dir[1];
+  if(t<=0) return null;
+  return [eye[0]+dir[0]*t,planeY,eye[2]+dir[2]*t];
+}
+function dropSeedPatchAtScreen(px,py) {
+  const p=groundPointAtScreen(px,py); if(!p) return false;
+  const count=4+Math.floor(seeded(nextSeedId+3)*4);
+  for(let k=0;k<count;k++) {
+    const id=nextSeedId++, angle=seeded(id+10)*TAU;
+    const radius=.025+Math.sqrt(seeded(id+20))*.095;
+    const x=Math.max(-half+.055,Math.min(half-.055,p[0]+Math.cos(angle)*radius));
+    const z=Math.max(-half+.055,Math.min(half-.055,p[2]+Math.sin(angle)*radius));
+    const crowded=plants.some(item=>(item.x-x)**2+(item.z-z)**2<.055**2)
+                  ||seeds.some(item=>(item.x-x)**2+(item.z-z)**2<.055**2);
+    if(crowded) continue;
+    const startHeight=.42+seeded(id+30)*.35;
+    seeds.push({id,x,z,y:startHeight,startHeight,fall:.48+seeded(id+40)*.18,fromX:px,fromY:py});
+  }
+  if(seeds.length>140) seeds.splice(0,seeds.length-140);
+  return true;
+}
+function updateWorld(dt) {
+  for(const seed of seeds) {
+    seed.y-=seed.fall*dt;
+  }
+  for(let i=seeds.length-1;i>=0;i--) if(seeds[i].y<=.02) {
+    const seed=seeds.splice(i,1)[0], id=seed.id;
+    const type=seeded(id+70)<.22?'flower':'grass';
+    const species=type==='flower'?chooseFlower(id,score):'daisy';
+    const colors=FLOWER_PALETTES[species];
+    const profile=flowerProfile(species);
+    const growTime=type==='flower'?7+seeded(id+110)*5:4+seeded(id+110)*2.5;
+    plants.push({x:seed.x,z:seed.z,type,age:0,phase:seeded(id+80)*TAU,
+                 species,flowerColor:colors[Math.floor(seeded(id+120)*colors.length)],
+                 height:(species==='lavender'||species==='dandelion') ? .36+seeded(id+130)*.18 : .25+seeded(id+130)*.21,
+                 size:.72+seeded(id+140)*.72,growTime,points:profile.points,
+                 petals:species==='daisy'?8+Math.floor(seeded(id+150)*5):species==='poppy'?4+Math.floor(seeded(id+160)*3):species==='tulip'?3:species==='dandelion'?16+Math.floor(seeded(id+170)*8):7+Math.floor(seeded(id+180)*5)});
+  }
+  const matureFlowers=[];
+  for(const plant of plants) {
+    plant.age+=dt;
+    if(plant.type==='flower'&&!plant.harvested&&plant.age>=plant.growTime) matureFlowers.push(plant);
+    if(plant.harvested) {
+      plant.harvested.age+=dt;
+      if(plant.species==='dandelion'&&!plant.fluffReleased&&plant.harvested.age>.12) {
+        plant.fluffReleased=true;
+        const y=.02+(plant.height||.42);
+        for(let i=0;i<18;i++) {
+          const a=seeded(i+plant.phase*100)*TAU, speed=.045+seeded(i+plant.age*10)*.12;
+          fluffs.push({x:plant.x+(seeded(i+plant.phase*200)-.5)*.025,y,z:plant.z+(seeded(i+plant.phase*300)-.5)*.025,
+                       vx:Math.cos(a)*speed,vy:.035+seeded(i+plant.phase*400)*.13,vz:Math.sin(a)*speed,
+                       age:0,life:1.1+seeded(i+plant.phase*500)*.65});
+        }
+      }
+    }
+  }
+  plants=plants.filter(plant=>plant.harvested?plant.harvested.age<.95:plant.age<(plant.growTime+65));
+  for(const butterfly of butterflies) butterfly.age+=dt;
+  butterflies=butterflies.filter(butterfly=>butterfly.age<butterfly.life);
+  butterflySpawnTimer-=dt;
+  const butterflyLimit=matureFlowers.length>=5?Math.min(5,Math.floor(matureFlowers.length/3)):0;
+  if(butterflyLimit>butterflies.length&&butterflySpawnTimer<=0) {
+    const id=nextButterflyId++, host=matureFlowers[Math.floor(seeded(id+17)*matureFlowers.length)];
+    const roll=seeded(id+29);
+    const colors=roll<.68?['#fffdf6',.92]:roll<.80?['#efbfd0',.84]:roll<.90?['#f1d78c',.88]:['#b9d7ee',.9];
+    const entrySide=seeded(id+79)<.5?-1:1, entryY=height*(.58+seeded(id+89)*.17);
+    let entry=worldPointForScreenAtHeight(entrySide<0?-42:width+42,entryY,.48);
+    if(!entry) entry=worldPointForScreenAtHeight(entrySide<0?-42:width+42,height*.78,.48);
+    if(!entry) entry=[host.x+entrySide*3,.48,host.z+.8];
+    const entersFor=8+seeded(id+127)*4;
+    butterflies.push({id,startX:entry[0],startZ:entry[2],targetX:host.x,targetZ:host.z,host,
+                       phase:seeded(id+37)*TAU,speed:.28+seeded(id+47)*.22,span:.13+seeded(id+57)*.15,
+                       entersFor,willPerch:seeded(id+97)<.27,perchAfter:entersFor+2+seeded(id+107)*2.5,
+                       perchFor:2.2+seeded(id+117)*1.5,color:colors[0],alpha:colors[1],age:0,life:18+seeded(id+67)*8});
+    butterflySpawnTimer=2+seeded(id+77)*2.5;
+  } else if(butterflyLimit===0) butterflySpawnTimer=Math.max(butterflySpawnTimer,1.5);
+  for(const fluff of fluffs) {
+    fluff.age+=dt; fluff.x+=fluff.vx*dt; fluff.y+=fluff.vy*dt;
+    fluff.z+=fluff.vz*dt; fluff.vy-=.045*dt;
+  }
+  fluffs=fluffs.filter(fluff=>fluff.age<fluff.life);
+  for(const pickup of pickups) pickup.age+=dt;
+  pickups=pickups.filter(p=>p.age<.9);
+  if(unlockToast) {
+    unlockToast.age+=dt;
+    if(unlockToast.age>2.8) unlockToast=null;
+  }
+}
+function drawWobblyLine(a, b, project, ink, w, seed) {
+  const A = project(a), B = project(b); if (!A || !B) return;
+  const dx = B[0]-A[0], dy = B[1]-A[1], len = Math.hypot(dx,dy) || 1;
+  const bend = (seeded(seed)-.5)*2.4*scale;
+  const mx=(A[0]+B[0])/2 - dy/len*bend, my=(A[1]+B[1])/2 + dx/len*bend;
+  ctx.beginPath(); ctx.moveTo(A[0], A[1]);
+  ctx.quadraticCurveTo(mx, my, B[0], B[1]);
+  ctx.strokeStyle = color(ink, .49); ctx.lineWidth = w*scale; ctx.lineCap='round'; ctx.stroke();
+  // A faint offset pass gives the contour a soft, imperfect ink edge.
+  ctx.beginPath(); ctx.moveTo(A[0]+.8*scale, A[1]+.5*scale);
+  ctx.quadraticCurveTo(mx+.8*scale, my+.5*scale, B[0]+.8*scale, B[1]+.5*scale);
+  ctx.strokeStyle = color(ink, .12); ctx.lineWidth = w*.62*scale; ctx.stroke();
+}
+function washBlob(cx, cz, rx, rz, project, hex, alpha, seed) {
+  const pts=[];
+  for(let i=0;i<13;i++) {
+    const a=i/13*TAU, wobble=.78+seeded(seed+i*17)*.43;
+    pts.push(project([cx+Math.cos(a)*rx*wobble,.014,cz+Math.sin(a)*rz*wobble]));
+  }
+  if(pts.some(p=>!p)) return;
+  ctx.save();
+  ctx.shadowColor=color(hex,alpha*.48); ctx.shadowBlur=9*scale;
+  polygon(pts,color(hex,alpha));
+  ctx.restore();
+  // Offset wash, like pigment settling unevenly into paper.
+  polygon(pts.map(p=>[p[0]+1.6*scale,p[1]+.9*scale]),color(hex,alpha*.34));
+}
+function drawGrassWash(project, pal) {
+  // Soft, overlapping pigment blooms keep the lawn from reading as a flat polygon.
+  const patches=[
+    [-.54,.48,.54,.34,pal.dark,.16],[-.18,.12,.62,.43,pal.light,.22],
+    [.43,.36,.44,.33,pal.dark,.13],[.51,-.36,.43,.31,pal.light,.18],
+    [-.45,-.47,.48,.31,pal.light,.16],[.03,-.28,.57,.37,pal.dark,.12]
+  ];
+  patches.forEach(([x,z,rx,rz,tone,alpha],i)=>washBlob(x,z,rx,rz,project,tone,alpha,80+i*21));
+}
+function drawGrassBlades(project, pal, time) {
+  // Fixed clumps of tapered blades sway together in a slow, passing breeze.
+  for(const blade of grassBlades) {
+    const gust=Math.sin(time*1.05+blade.phase+blade.x*1.6+blade.z*.8)*.075
+               +Math.sin(time*.43+blade.phase*.6)*.025;
+    const lean=blade.baseX+gust, side=blade.side+Math.sin(time*.82+blade.phase)*.018;
+    const y=.018, h=blade.h;
+    const p0=project([blade.x,y,blade.z]);
+    const p1=project([blade.x+lean*.16,y+h*.34,blade.z+side*.22]);
+    const p2=project([blade.x+lean*.62,y+h*.73,blade.z+side*.68]);
+    const p3=project([blade.x+lean,y+h,blade.z+side]);
+    if(!p0||!p1||!p2||!p3) continue;
+    const ink=blade.tone>.76?pal.light:blade.tone>.34?pal.dark:pal.top;
+    drawTaperedBlade(p0,p1,p2,p3,ink,(1.05+blade.h*.7)*scale,.52);
+  }
+}
+function drawPlants(project,pal) {
+  const sorted=[...plants].sort((a,b)=>(a.x*Math.sin(camera.angle)+a.z*Math.cos(camera.angle))-
+                                      (b.x*Math.sin(camera.angle)+b.z*Math.cos(camera.angle)));
+  for(const plant of sorted) {
+    const isFlower=plant.type==='flower', duration=plant.growTime|| (isFlower?8:5.5);
+    const lifetime=duration+65, fadeDuration=isFlower?7:5;
+    const lifeFade=Math.min(1,Math.max(0,(lifetime-plant.age)/fadeDuration));
+    const harvestT=plant.harvested?Math.min(1,plant.harvested.age/.95):0;
+    const fade=lifeFade*(1-harvestT);
+    if(fade<=0) continue;
+    ctx.save(); ctx.globalAlpha=fade;
+    const growth=Math.min(1,plant.age/duration);
+    const h=growth*(isFlower?(plant.height||.34):.23);
+    const breeze=Math.sin(animationTime*.95+plant.phase)*.035*growth+harvestT*.075;
+    if(!isFlower) {
+      for(let i=0;i<5;i++) {
+        const a=plant.phase+i*TAU/5, leanX=Math.cos(a)*(.045+breeze), leanZ=Math.sin(a)*.06;
+        const p0=project([plant.x,.02,plant.z]);
+        const p1=project([plant.x+leanX*.12,.02+h*.33,plant.z+leanZ*.12]);
+        const p2=project([plant.x+leanX*.62,.02+h*.72,plant.z+leanZ*.68]);
+        const p3=project([plant.x+leanX,.02+h,plant.z+leanZ]);
+        if(p0&&p1&&p2&&p3) drawTaperedBlade(p0,p1,p2,p3,i%2?pal.dark:pal.light,(.9+growth*.5)*scale,.7);
+      }
+      ctx.restore(); continue;
+    }
+    const x=plant.x+harvestT*.055,z=plant.z,y=.02+harvestT*.16,size=plant.size||1;
+    const base=project([x,y,z]), mid=project([x+breeze*.25,y+h*.52,z]), tip=project([x+breeze,y+h,z]);
+    if(!base||!mid||!tip) { ctx.restore(); continue; }
+    ctx.beginPath(); ctx.moveTo(base[0],base[1]);
+    ctx.quadraticCurveTo(mid[0],mid[1],tip[0],tip[1]);
+    ctx.strokeStyle=color('#718b65',.78); ctx.lineWidth=1.1*scale; ctx.lineCap='round'; ctx.stroke();
+    if(growth>.34) {
+      for(const side of [-1,1]) {
+        const leaf=project([x+side*.055*size,y+h*.39,z+side*.025]);
+        const root=project([x+breeze*.25,y+h*.34,z]);
+        if(!leaf||!root) continue;
+        ctx.beginPath(); ctx.ellipse((leaf[0]+root[0])/2,(leaf[1]+root[1])/2,3.3*size*scale,1.35*size*scale,side*.4,0,TAU);
+        ctx.fillStyle=color(pal.dark,.62); ctx.fill();
+      }
+    }
+    if(growth>.25) {
+      const bloom=Math.min(1,(growth-.25)/.75), center=project([x+breeze,y+h,z]);
+      if(center) {
+        const species=plant.species||'daisy', petal=plant.flowerColor||'#eee8dc';
+        const radius=(1.3+growth*4.8)*size*scale*bloom;
+        if(species==='dandelion') {
+          const puffRadius=radius*1.28, spokes=plant.petals||18;
+          for(let i=0;i<spokes;i++) {
+            const a=i/spokes*TAU+plant.phase, reach=puffRadius*(.72+seeded(i+plant.phase*10)*.28);
+            const sx=center[0]+Math.cos(a)*puffRadius*.13, sy=center[1]+Math.sin(a)*puffRadius*.13;
+            const ex=center[0]+Math.cos(a)*reach, ey=center[1]+Math.sin(a)*reach;
+            ctx.beginPath(); ctx.moveTo(sx,sy);
+            ctx.quadraticCurveTo(center[0]+Math.cos(a+.16)*reach*.48,center[1]+Math.sin(a+.16)*reach*.48,ex,ey);
+            ctx.strokeStyle=color('#fffdf7',.72); ctx.lineWidth=.58*scale; ctx.lineCap='round'; ctx.stroke();
+            ctx.beginPath(); ctx.arc(ex,ey,.72*scale,0,TAU);
+            ctx.fillStyle=color('#f8f6ef',.9); ctx.fill();
+          }
+          ctx.save(); ctx.shadowColor='rgba(255,253,247,.65)'; ctx.shadowBlur=2.5*scale;
+          ctx.beginPath(); ctx.arc(center[0],center[1],Math.max(1.4,puffRadius*.3),0,TAU);
+          ctx.fillStyle=color('#fffdf7',.9); ctx.fill(); ctx.restore();
+        } else if(species==='lavender') {
+          const buds=plant.petals||9;
+          for(let i=0;i<buds;i++) {
+            const t=.48+.5*i/Math.max(1,buds-1), side=i%2?1:-1;
+            const bx=center[0]+Math.sin(plant.phase+i*.8)*radius*.1+side*radius*.34;
+            const by=center[1]+radius*.95*(1-t);
+            ctx.beginPath(); ctx.ellipse(bx,by,radius*.28,radius*.21,-side*.55,0,TAU);
+            ctx.fillStyle=color(petal,.5+.3*bloom); ctx.fill();
+          }
+        } else if(species==='tulip') {
+          ctx.beginPath();
+          ctx.moveTo(center[0]-radius*.62,center[1]+radius*.36);
+          ctx.quadraticCurveTo(center[0]-radius*.88,center[1]-.02*scale,center[0]-radius*.58,center[1]-radius*.48);
+          ctx.quadraticCurveTo(center[0]-radius*.34,center[1]-radius*.66,center[0]-radius*.12,center[1]-radius*.28);
+          ctx.quadraticCurveTo(center[0],center[1]-radius*1.08,center[0]+radius*.13,center[1]-radius*.28);
+          ctx.quadraticCurveTo(center[0]+radius*.39,center[1]-radius*.67,center[0]+radius*.61,center[1]-radius*.45);
+          ctx.quadraticCurveTo(center[0]+radius*.88,center[1]-.01*scale,center[0]+radius*.62,center[1]+radius*.36);
+          ctx.quadraticCurveTo(center[0],center[1]+radius*.65,center[0]-radius*.62,center[1]+radius*.36);
+          ctx.fillStyle=color(petal,.62+.2*bloom); ctx.fill();
+        } else {
+          const count=plant.petals||(species==='poppy'?5:10);
+          const petalRadius=radius*(species==='poppy' ? .76 : .58);
+          for(let i=0;i<count;i++) {
+            const a=i/count*TAU+plant.phase, spread=species==='poppy' ? .55 : .78;
+            const ox=Math.cos(a)*petalRadius*spread, oy=Math.sin(a)*petalRadius*spread*.68;
+            const rx=petalRadius*(species==='poppy' ? .52 : .34), ry=petalRadius*(species==='poppy' ? .43 : .24);
+            ctx.beginPath(); ctx.ellipse(center[0]+ox,center[1]+oy,rx,ry,a,0,TAU);
+            ctx.fillStyle=color(petal,.6+.22*bloom); ctx.fill();
+          }
+          ctx.beginPath(); ctx.arc(center[0],center[1],Math.max(1.2,radius*(species==='poppy'?.24:.18)),0,TAU);
+          ctx.fillStyle=color(species==='poppy'?'#77584c':'#c59b57',.88); ctx.fill();
+        }
+      }
+    }
+    ctx.restore();
+  }
+  for(const seed of seeds) {
+    const target=project([seed.x,.02,seed.z]); if(!target) continue;
+    const progress=Math.max(0,Math.min(1,1-seed.y/seed.startHeight));
+    const sx=seed.fromX+(target[0]-seed.fromX)*progress;
+    const sy=seed.fromY+(target[1]-seed.fromY)*progress;
+    const size=(1.8+progress*.35)*scale;
+    ctx.beginPath(); ctx.ellipse(sx,sy,size,size*.6,-.38,0,TAU);
+    ctx.fillStyle='rgba(112,83,54,.78)'; ctx.fill();
+  }
+  for(const fluff of fluffs) {
+    const p=project([fluff.x,fluff.y,fluff.z]); if(!p) continue;
+    ctx.save(); ctx.globalAlpha=Math.max(0,1-fluff.age/fluff.life);
+    ctx.beginPath(); ctx.moveTo(p[0]-1.7*scale,p[1]); ctx.lineTo(p[0]+1.7*scale,p[1]);
+    ctx.moveTo(p[0],p[1]-1.7*scale); ctx.lineTo(p[0],p[1]+1.7*scale);
+    ctx.strokeStyle='#fffdf7'; ctx.lineWidth=.65*scale; ctx.stroke();
+    ctx.beginPath(); ctx.arc(p[0],p[1],.85*scale,0,TAU); ctx.fillStyle='#f8f6ef'; ctx.fill();
+    ctx.restore();
+  }
+}
+function drawButterflies(project) {
+  for(const butterfly of butterflies) {
+    const phase=animationTime*butterfly.speed+butterfly.phase;
+    const arrival=Math.max(0,Math.min(1,butterfly.age/butterfly.entersFor));
+    const ease=arrival*arrival*(3-2*arrival);
+    let x=butterfly.targetX, z=butterfly.targetZ;
+    let y=.48+Math.sin(phase*1.8)*.045;
+    const hostAvailable=butterfly.host&&!butterfly.host.harvested&&plants.includes(butterfly.host);
+    const perched=butterfly.willPerch&&hostAvailable&&butterfly.age>=butterfly.perchAfter
+                  &&butterfly.age<butterfly.perchAfter+butterfly.perchFor;
+    let p, heading=butterfly.heading||0;
+    if(arrival<1) {
+      const start=project([butterfly.startX,.48,butterfly.startZ]);
+      const target=project([butterfly.targetX,.48,butterfly.targetZ]); if(!target) continue;
+      if(!start) continue;
+      const dx=target[0]-start[0], dy=target[1]-start[1];
+      p=[start[0]+dx*ease,start[1]+dy*ease];
+      heading=Math.atan2(dy,dx)-Math.PI/2;
+    } else {
+      const orbitBlend=Math.min(1,(butterfly.age-butterfly.entersFor)/1.4);
+      x=butterfly.targetX+Math.sin(phase)*butterfly.span*orbitBlend;
+      z=butterfly.targetZ+Math.cos(phase*.73)*butterfly.span*.72*orbitBlend;
+      if(perched) {
+        x=butterfly.host.x; z=butterfly.host.z;
+        y=.035+(butterfly.host.height||.34);
+      }
+      x=Math.max(-half+.025,Math.min(half-.025,x));
+      z=Math.max(-half+.025,Math.min(half-.025,z));
+      p=project([x,y,z]); if(!p) continue;
+      if(!perched) {
+        const nextPhase=phase+butterfly.speed*.08;
+        const nextX=butterfly.targetX+Math.sin(nextPhase)*butterfly.span*orbitBlend;
+        const nextZ=butterfly.targetZ+Math.cos(nextPhase*.73)*butterfly.span*.72*orbitBlend;
+        const next=project([nextX,y,nextZ]);
+        if(next) heading=Math.atan2(next[1]-p[1],next[0]-p[0])-Math.PI/2;
+      }
+      butterfly.heading=heading;
+    }
+    const fade=Math.min(1,butterfly.age/.6,(butterfly.life-butterfly.age)/1.2);
+    const flap=.3+.7*Math.abs(Math.sin(animationTime*(perched?1.5:4.5)+butterfly.phase));
+    const wingFold=perched ? .42 : 1;
+    ctx.save(); ctx.translate(p[0],p[1]);
+    ctx.rotate(heading+Math.sin(phase*.45)*.08); ctx.globalAlpha=butterfly.alpha*Math.max(0,fade);
+    ctx.shadowColor=color(butterfly.color,.35); ctx.shadowBlur=3.5*scale;
+    ctx.beginPath(); ctx.ellipse(-2.25*scale*wingFold,0,2.8*scale*flap*wingFold,3.2*scale,-.32,0,TAU);
+    ctx.ellipse(2.25*scale*wingFold,0,2.8*scale*flap*wingFold,3.2*scale,.32,0,TAU);
+    ctx.fillStyle=butterfly.color; ctx.fill(); ctx.shadowBlur=0;
+    ctx.beginPath(); ctx.ellipse(0,0,.62*scale,2.3*scale,0,0,TAU);
+    ctx.fillStyle='#766b5d'; ctx.fill();
+    ctx.beginPath(); ctx.arc(0,-2.2*scale,.65*scale,0,TAU); ctx.fillStyle='#766b5d'; ctx.fill();
+    ctx.beginPath(); ctx.moveTo(-.25*scale,-2.7*scale); ctx.quadraticCurveTo(-1.1*scale,-3.5*scale,-1.2*scale,-3.7*scale);
+    ctx.moveTo(.25*scale,-2.7*scale); ctx.quadraticCurveTo(1.1*scale,-3.5*scale,1.2*scale,-3.7*scale);
+    ctx.strokeStyle='rgba(95,83,69,.7)'; ctx.lineWidth=.42*scale; ctx.stroke();
+    ctx.restore();
+  }
+}
+function drawBlock(project, pal) {
+  const top=[[half,0,half],[half,0,-half],[-half,0,-half],[-half,0,half]];
+  const low=top.map(p=>[p[0],bottom,p[2]]);
+  // Fixed, gently irregular edges imitate a hand-cut watercolor vignette.
+  const topEdges=top.map((p,i)=>wavyEdge(p,top[(i+1)%4],.055,120+i*37));
+  const lowEdges=low.map((p,i)=>wavyEdge(p,low[(i+1)%4],.045,320+i*41));
+  const topBoundary=topEdges.flatMap((edge,i)=>i<3?edge.slice(0,-1):edge);
+  // Keep only the two camera-facing sides, then paint them from far to near.
+  const eyeX=Math.sin(camera.angle), eyeZ=Math.cos(camera.angle);
+  const faces=[];
+  for(let i=0;i<4;i++) {
+    const j=(i+1)%4;
+    const normals=[[1,0],[0,-1],[-1,0],[0,1]], [nx,nz]=normals[i];
+    if(nx*eyeX+nz*eyeZ<=0) continue;
+    const pts=[top[i],top[j],low[j],low[i]], center=pts.reduce((a,p)=>a+p[2],0)/4;
+    const centerX=pts.reduce((a,p)=>a+p[0],0)/4;
+    // Camera depth: larger means closer to the viewer, so paint smaller depths first.
+    const depth=Math.sin(camera.tilt)*(centerX*Math.sin(camera.angle)+center*Math.cos(camera.angle));
+    faces.push({depth,pts,shape:[...topEdges[i],...lowEdges[i].slice().reverse()],side:i});
+  }
+  faces.sort((a,b)=>a.depth-b.depth);
+  for(const f of faces) {
+    const sideColor=f.side%2===0?pal.side:pal.soil;
+    softPolygon(f.shape.map(project),sideColor,.84,4.5);
+    // Irregular, translucent earth stains replace the rigid plank-like stripes.
+    const [a,b,,c]=f.pts;
+    for(let n=0;n<7;n++) {
+      const u=.12+seeded(n+f.side*31)*.76, v=.14+seeded(n+f.side*67+11)*.72;
+      const ru=.04+seeded(n+f.side*91+29)*.07, rv=.09+seeded(n+f.side*111+43)*.12, blob=[];
+      for(let k=0;k<8;k++) {
+        const ang=k/8*TAU, wobble=.72+seeded(k+n*19+f.side*101)*.5;
+        const uu=u+Math.cos(ang)*ru*wobble, vv=v+Math.sin(ang)*rv*wobble;
+        blob.push([a[0]+(b[0]-a[0])*uu+(c[0]-a[0])*vv,
+                   a[1]+(b[1]-a[1])*uu+(c[1]-a[1])*vv,
+                   a[2]+(b[2]-a[2])*uu+(c[2]-a[2])*vv]);
+      }
+      polygon(blob.map(project),color(n%2?pal.soil:pal.light,.13));
+    }
+  }
+  softPolygon(topBoundary.map(project),pal.top,.98,5.5);
+  drawGrassWash(project,pal);
+}
+function drawSwatches() {
+  const side=25*scale, gap=13*scale, total=themes.length*side+(themes.length-1)*gap;
+  const start=(width-total)/2, y=height-48*scale;
+  themes.forEach((t,i)=>{
+    const x=start+i*(side+gap);
+    const shape=roughSquare(x,y,side,i+701);
+    polygon(roughSquare(x-1.2*scale,y-.8*scale,side+2.4*scale,i+901),color(t.top,.18));
+    polygon(shape,color(t.top,.94));
+    // A small dry-brush underline marks the active color without a rigid box outline.
+    if(i===themeIndex) {
+      ctx.beginPath(); ctx.moveTo(x+3*scale,y+side+5*scale);
+      ctx.quadraticCurveTo(x+side*.48,y+side+4.2*scale,x+side-3*scale,y+side+5.4*scale);
+      ctx.strokeStyle=color(t.ink,.38); ctx.lineWidth=1.25*scale; ctx.lineCap='round'; ctx.stroke();
+    }
+  });
+}
+function swatchAt(px,py) {
+  const side=25*scale,gap=13*scale,total=themes.length*side+(themes.length-1)*gap;
+  const start=(width-total)/2,y=height-48*scale;
+  for(let i=0;i<themes.length;i++) {
+    const x=start+i*(side+gap);
+    if(px>=x-4*scale&&px<=x+side+4*scale&&py>=y-4*scale&&py<=y+side+10*scale) return i;
+  }
+  return -1;
+}
+function hitSowButton(px,py) {
+  const x=18*scale,y=18*scale,w=112*scale,h=36*scale;
+  return px>=x&&px<=x+w&&py>=y&&py<=y+h;
+}
+function hitHarvestButton(px,py) {
+  const x=18*scale,y=60*scale,w=112*scale,h=36*scale;
+  return px>=x&&px<=x+w&&py>=y&&py<=y+h;
+}
+function drawHUD() {
+  ctx.save();
+  const buttons=[
+    {y:18,label:sowMode?'播种中':'播种',active:sowMode,icon:'✿'},
+    {y:60,label:harvestMode?'收割中':'收割',active:harvestMode,icon:'⌁'}
+  ];
+  for(const b of buttons) {
+    const x=18*scale,y=b.y*scale,w=112*scale,h=36*scale;
+    ctx.beginPath(); ctx.roundRect(x,y,w,h,11*scale);
+    ctx.fillStyle=b.active?'rgba(137,157,111,.88)':'rgba(235,226,207,.88)'; ctx.fill();
+    ctx.strokeStyle='rgba(91,79,61,.24)'; ctx.lineWidth=.8*scale; ctx.stroke();
+    ctx.fillStyle=b.active?'#f7f1e4':'#53483b';
+    ctx.font=`${13*scale}px Georgia, "Noto Serif CJK SC", serif`;
+    ctx.textBaseline='middle'; ctx.fillText(`${b.icon}  ${b.label}`,x+13*scale,y+h/2);
+  }
+  if(sowMode||harvestMode) {
+    ctx.font=`${10*scale}px Georgia, "Noto Serif CJK SC", serif`;
+    ctx.fillStyle='rgba(78,71,57,.68)';
+    ctx.fillText(sowMode?'拖动草地撒种':'划过成熟花朵收割',18*scale,111*scale);
+  }
+  ctx.textAlign='right'; ctx.textBaseline='top';
+  ctx.font=`${14*scale}px Georgia, "Noto Serif CJK SC", serif`;
+  ctx.fillStyle='rgba(81,68,53,.78)'; ctx.fillText(`花朵积分  ${score}`,width-20*scale,22*scale);
+  const next=nextFlowerUnlock();
+  const unlocked=FLOWERS.filter(f=>score>=f.unlockAt).length;
+  ctx.font=`${10*scale}px Georgia, "Noto Serif CJK SC", serif`;
+  ctx.fillStyle='rgba(81,68,53,.62)';
+  ctx.fillText(next?`已解锁 ${unlocked}/${FLOWERS.length} · 下种 ${next.name} ${next.unlockAt}分`:`已解锁全部 ${FLOWERS.length} 种`,width-20*scale,43*scale);
+  if(next) {
+    const previous=FLOWERS[FLOWERS.indexOf(next)-1].unlockAt;
+    const progress=Math.max(0,Math.min(1,(score-previous)/(next.unlockAt-previous)));
+    const barWidth=105*scale, barY=59*scale;
+    ctx.beginPath(); ctx.roundRect(width-20*scale-barWidth,barY,barWidth,3*scale,2*scale);
+    ctx.fillStyle='rgba(94,81,64,.14)'; ctx.fill();
+    ctx.beginPath(); ctx.roundRect(width-20*scale-barWidth,barY,barWidth*progress,3*scale,2*scale);
+    ctx.fillStyle='rgba(137,157,111,.72)'; ctx.fill();
+  }
+  if(unlockToast) {
+    const label=`新花种解锁：${unlockToast.name}`;
+    ctx.font=`${12*scale}px Georgia, "Noto Serif CJK SC", serif`;
+    const toastW=ctx.measureText(label).width+28*scale, toastH=31*scale;
+    const toastX=(width-toastW)/2, toastY=18*scale;
+    ctx.globalAlpha=Math.min(1,(2.8-unlockToast.age)*2);
+    ctx.beginPath(); ctx.roundRect(toastX,toastY,toastW,toastH,12*scale);
+    ctx.fillStyle='rgba(245,238,221,.94)'; ctx.fill();
+    ctx.strokeStyle='rgba(91,79,61,.2)'; ctx.lineWidth=.8*scale; ctx.stroke();
+    ctx.fillStyle='#665440'; ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.fillText(label,width/2,toastY+toastH/2); ctx.textAlign='right'; ctx.textBaseline='top'; ctx.globalAlpha=1;
+  }
+  ctx.textAlign='left';
+  for(const pickup of pickups) {
+    const p=cameraBasis()([pickup.x,.38+pickup.age*.12,pickup.z]); if(!p) continue;
+    ctx.globalAlpha=1-pickup.age/.9; ctx.font=`${12*scale}px Georgia, serif`;
+    ctx.fillStyle='#8b6c48'; ctx.fillText(`+${pickup.points||1}`,p[0],p[1]);
+  }
+  ctx.restore();
+}
+function harvestAlongSegment(x1,y1,x2,y2) {
+  const project=cameraBasis(), vx=x2-x1, vy=y2-y1, denom=vx*vx+vy*vy, radius=19*scale;
+  let harvested=false;
+  for(let i=plants.length-1;i>=0;i--) {
+    const plant=plants[i];
+    if(plant.type!=='flower'||plant.harvested||plant.age<(plant.growTime||8)) continue;
+    const p=project([plant.x,.02+(plant.height||.34),plant.z]); if(!p) continue;
+    const t=denom?Math.max(0,Math.min(1,((p[0]-x1)*vx+(p[1]-y1)*vy)/denom)):0;
+    const d=Math.hypot(p[0]-(x1+vx*t),p[1]-(y1+vy*t));
+    if(d<=radius) {
+      const picked=plants[i], previousScore=score, points=picked.points||flowerProfile(picked.species).points;
+      picked.harvested={age:0}; score+=points;
+      pickups.push({x:picked.x,z:picked.z,age:0,points}); harvested=true;
+      const unlockedNow=FLOWERS.filter(f=>f.unlockAt>previousScore&&f.unlockAt<=score);
+      if(unlockedNow.length) unlockToast={name:unlockedNow[unlockedNow.length-1].name,age:0};
+    }
+  }
+  return harvested;
+}
+function render(time=animationTime) {
+  if(!width || !height) return;
+  animationTime=time;
+  const key=[width,height,dpr,themeIndex,camera.angle.toFixed(4),camera.tilt.toFixed(4),camera.distance.toFixed(3)].join(':');
+  if(key!==staticCacheKey) {
+    staticLayer.width=Math.round(width*dpr); staticLayer.height=Math.round(height*dpr);
+    staticContext=staticLayer.getContext('2d'); ctx=staticContext;
+    ctx.setTransform(dpr,0,0,dpr,0,0); ctx.lineCap='round'; ctx.lineJoin='round';
+    ctx.clearRect(0,0,width,height); ctx.drawImage(paper,0,0,width,height);
+    const staticProject=cameraBasis(), c=staticProject([0,bottom-.02,0]);
+    if(c) { ctx.save(); ctx.translate(c[0],c[1]+18*scale); ctx.scale(1.18,.19); const g=ctx.createRadialGradient(0,0,10,0,0,190*scale); g.addColorStop(0,'rgba(89,72,52,.18)');g.addColorStop(1,'rgba(89,72,52,0)');ctx.fillStyle=g;ctx.beginPath();ctx.arc(0,0,190*scale,0,TAU);ctx.fill();ctx.restore(); }
+    drawBlock(staticProject,themes[themeIndex]);
+    staticCacheKey=key; ctx=mainContext; ctx.setTransform(dpr,0,0,dpr,0,0);
+  }
+  ctx=mainContext; ctx.clearRect(0,0,width,height); ctx.drawImage(staticLayer,0,0,width,height);
+  const project=cameraBasis();
+  drawGrassBlades(project,themes[themeIndex],animationTime);
+  drawPlants(project,themes[themeIndex]); drawButterflies(project); drawSwatches(); drawHUD();
+}
+function animate(now) {
+  const t=now*.001;
+  if(now-lastFrameTime>=1000/30) {
+    const dt=lastFrameTime?Math.min(.05,t-lastFrameTime*.001):0;
+    lastFrameTime=now; updateWorld(dt); render(t);
+  }
+  requestAnimationFrame(animate);
+}
+canvas.addEventListener('pointerdown',e=>{
+  if(hitSowButton(e.clientX,e.clientY)||hitHarvestButton(e.clientX,e.clientY)||swatchAt(e.clientX,e.clientY)>=0) return;
+  if(sowMode) {
+    drag={sowing:true,x:e.clientX,y:e.clientY,distance:0};
+    canvas.setPointerCapture(e.pointerId); dropSeedPatchAtScreen(e.clientX,e.clientY); return;
+  }
+  if(harvestMode) {
+    drag={harvesting:true,x:e.clientX,y:e.clientY};
+    canvas.setPointerCapture(e.pointerId); harvestAlongSegment(e.clientX,e.clientY,e.clientX,e.clientY); return;
+  }
+  drag={sowing:false,x:e.clientX,y:e.clientY,angle:camera.angle,tilt:camera.tilt};
+  canvas.setPointerCapture(e.pointerId);
+});
+canvas.addEventListener('pointermove',e=>{
+  if(!drag)return;
+  if(drag.sowing) {
+    const dx=e.clientX-drag.x,dy=e.clientY-drag.y,dist=Math.hypot(dx,dy);
+    const spacing=38*scale;
+    if(dist>0) {
+      const needed=spacing-drag.distance;
+      let along=needed;
+      while(along<=dist) {
+        const t=along/dist;
+        dropSeedPatchAtScreen(drag.x+dx*t,drag.y+dy*t);
+        along+=spacing;
+      }
+      drag.distance=(drag.distance+dist)%spacing;
+      drag.x=e.clientX; drag.y=e.clientY;
+    }
+    return;
+  }
+  if(drag.harvesting) {
+    harvestAlongSegment(drag.x,drag.y,e.clientX,e.clientY);
+    drag.x=e.clientX; drag.y=e.clientY; return;
+  }
+  camera.angle=drag.angle-(e.clientX-drag.x)*.008;
+  camera.tilt=Math.max(.55,Math.min(1.38,drag.tilt-(e.clientY-drag.y)*.006)); render();
+});
+canvas.addEventListener('pointerup',()=>drag=null); canvas.addEventListener('pointercancel',()=>drag=null);
+canvas.addEventListener('wheel',e=>{camera.distance=Math.max(4.3,Math.min(8,camera.distance+e.deltaY*.003));render();e.preventDefault();},{passive:false});
+canvas.addEventListener('click',e=>{
+  if(hitSowButton(e.clientX,e.clientY)) { sowMode=!sowMode; if(sowMode) harvestMode=false; drag=null; render(); return; }
+  if(hitHarvestButton(e.clientX,e.clientY)) { harvestMode=!harvestMode; if(harvestMode) sowMode=false; drag=null; render(); return; }
+  const swatch=swatchAt(e.clientX,e.clientY);
+  if(swatch>=0) { themeIndex=swatch; render(); return; }
+});
+window.addEventListener('resize',resize); resize(); requestAnimationFrame(animate);
+</script>
+</body>
+</html>
+
